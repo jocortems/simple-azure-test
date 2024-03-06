@@ -4,6 +4,11 @@ terraform {
       source  = "hashicorp/azurerm"
       version = "~> 3.81"
     }
+
+    http = {
+      source = "hashicorp/http"
+      version = "~> 3.4"
+    }
   }
 }
 
@@ -15,17 +20,121 @@ provider "azurerm" {
   }
 }
 
-resource "azurerm_resource_group" "rg_name" {
-  name = "cka"
-  location = "South Central US"
+provider "http" {}
+
+data "http" "my_ip" {
+  url = "http://ipv4.icanhazip.com"
 }
 
+resource "random_string" "prefix" {
+  length  = 6
+  special = false
+  upper   = false
+  numeric = false
+}
+
+resource "azurerm_resource_group" "rg_name" {
+  name = var.resource_group_name
+  location = var.location
+}
+
+resource "azurerm_virtual_network" "vnet" {
+  name                = var.vnet_name
+  location            = azurerm_resource_group.rg_name.location
+  resource_group_name = azurerm_resource_group.rg_name.name
+  address_space       = [var.vnet_cidr]
+}
 
 resource "azurerm_subnet" "cka" {
-    resource_group_name     = "jorge-rg"
+    resource_group_name     = azurerm_resource_group.rg_name.name
     name                    = "k8s-cluster"
-    virtual_network_name    = "linux-vm-vnet"
-    address_prefixes        = ["10.2.255.0/24"]
+    virtual_network_name    = azurerm_virtual_network.vnet.name
+    address_prefixes        = [cidrsubnet(azurerm_virtual_network.vnet.address_space[0],8, 1)]
+}
+
+resource "azurerm_subnet" "public_vm" {
+    resource_group_name     = azurerm_resource_group.rg_name.name
+    name                    = "jumpbox"
+    virtual_network_name    = azurerm_virtual_network.vnet.name
+    address_prefixes        = [cidrsubnet(azurerm_virtual_network.vnet.address_space[0],8, 0)]
+}
+
+resource "azurerm_network_security_group" "public_nsg" {
+  name                = "public-nsg"
+  location            = azurerm_resource_group.rg_name.location
+  resource_group_name = azurerm_resource_group.rg_name.name
+}
+
+resource "azurerm_network_security_rule" "public_nsg_rule" {
+  name                          = "Allow-home"
+  priority                      = 100
+  direction                     = "Inbound"
+  access                        = "Allow"
+  protocol                      = "*"
+  source_port_range             = "*"
+  destination_port_range        = "*"
+  source_address_prefixes       = [replace(data.http.my_ip.response_body,"\n","")]  
+  destination_address_prefix    = "*"
+  resource_group_name           = azurerm_resource_group.rg_name.name
+  network_security_group_name   = azurerm_network_security_group.public_nsg.name
+}
+
+resource "azurerm_subnet_network_security_group_association" "nsg_public_subnet_attach" {
+  subnet_id                 = azurerm_subnet.public_vm.id
+  network_security_group_id = azurerm_network_security_group.public_nsg.id
+}
+
+resource "azurerm_public_ip" "public_vm_pip" {
+  name                      = "jumpboxVM-pip"
+  location                  = azurerm_resource_group.rg_name.location
+  resource_group_name       = azurerm_resource_group.rg_name.name
+  allocation_method         = "Static"
+  sku                       = "Standard"
+}
+
+resource "azurerm_network_interface" "public_vm_nic" { 
+  name                    = "jumpboxVM-nic"
+  location                  = azurerm_resource_group.rg_name.location
+  resource_group_name       = azurerm_resource_group.rg_name.name
+  
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.public_vm.id
+    private_ip_address_allocation = "Static"
+    private_ip_address            = cidrhost(azurerm_subnet.public_vm.address_prefixes[0], 10)
+    public_ip_address_id          = azurerm_public_ip.public_vm_pip.id
+  }
+}
+
+resource "azurerm_linux_virtual_machine" "jumpbox_vm" {
+  name                      = "jumpboxVM"
+  location                  = azurerm_resource_group.rg_name.location
+  resource_group_name       = azurerm_resource_group.rg_name.name
+  size                      = var.vm_size
+  admin_username            = var.admin_username
+  network_interface_ids     = [
+    azurerm_network_interface.public_vm_nic.id
+  ]
+
+  custom_data = base64encode(file("cloud-init.sh"))
+  
+  disable_password_authentication = true
+  admin_ssh_key {
+        public_key = file("${path.module}/ssh-key.pub")
+        username = var.admin_username
+    }
+  
+  os_disk {
+    caching              = "ReadWrite"
+    storage_account_type = "Premium_LRS"
+  }
+
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "0001-com-ubuntu-server-focal"
+    sku       = "20_04-lts-gen2"
+    version   = "latest"
+  }
 }
 
 resource "azurerm_network_interface" "nic" { 
@@ -48,8 +157,8 @@ resource "azurerm_linux_virtual_machine" "k8s" {
   name                    = count.index == 0 ? "k8s-master" : format("k8s-worker-%s", count.index)
   location                = azurerm_resource_group.rg_name.location
   resource_group_name     = azurerm_resource_group.rg_name.name
-  size                    = "Standard_D2_v5"
-  admin_username          = "jcortes"
+  size                    = var.vm_size
+  admin_username          = var.admin_username
   network_interface_ids   = [
     azurerm_network_interface.nic[count.index].id
   ]
@@ -57,7 +166,7 @@ resource "azurerm_linux_virtual_machine" "k8s" {
   disable_password_authentication = true
   admin_ssh_key {
         public_key = file("${path.module}/ssh-key.pub")
-        username = "jcortes"
+        username = var.admin_username
     }
   
   os_disk {
@@ -111,7 +220,7 @@ resource "azurerm_subnet_route_table_association" "k8s_rt" {
 }
 
 resource "azurerm_subnet_route_table_association" "linuxvm" {
-  subnet_id               = "/subscriptions/9ea5dad2-ca12-4b85-a934-fa3514640ad9/resourceGroups/jorge-rg/providers/Microsoft.Network/virtualNetworks/linux-vm-vnet/subnets/default"
+  subnet_id               = azurerm_subnet.public_vm.id
   route_table_id          = azurerm_route_table.pod_cidr.id
 }
 
@@ -135,15 +244,15 @@ resource "azurerm_network_security_rule" "nsg_rule" {
   network_security_group_name = azurerm_network_security_group.nsg.name
 }
 
-resource "azurerm_subnet_network_security_group_association" "nsg_public_subnet_attach" {
+resource "azurerm_subnet_network_security_group_association" "nsg_k8s_subnet_attach" {
   subnet_id                 = azurerm_subnet.cka.id
   network_security_group_id = azurerm_network_security_group.nsg.id
 }
 
 resource "azurerm_storage_account" "flow_logs" {
-  name                      	 = "hszeflowlogs"
-  resource_group_name       	 = azurerm_resource_group.aviatrix_rg.name
-  location                  	 = azurerm_resource_group.aviatrix_rg.location
+  name                      	 = format("flowlogs%s", random_string.prefix.result)
+  resource_group_name       	 = azurerm_resource_group.rg_name.name
+  location                  	 = azurerm_resource_group.rg_name.location
   account_tier              	 = "Standard"
   public_network_access_enabled  = true
   account_replication_type  	 = "LRS"
@@ -152,7 +261,7 @@ resource "azurerm_storage_account" "flow_logs" {
 }
 
 resource "azurerm_network_watcher_flow_log" "flow_logs" {
-  network_watcher_name = "NetworkWatcher_southcentralus"
+  network_watcher_name = format("NetworkWatcher_%s", azurerm_resource_group.rg_name.location)
   resource_group_name  = "NetworkWatcherRG"
   name                 = "cka-log"
 
